@@ -28,9 +28,11 @@
 extern "C" {
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
+#include <libavutil/frame.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/rational.h>
 }
 #include <cros_gralloc/cros_gralloc_handle.h>
 #if CONFIG_VAAPI
@@ -58,6 +60,7 @@ typedef struct {
     int width;
     int height;
     int format;
+    bool hwFrames;
 } FilterSettings;
 
 namespace android {
@@ -167,6 +170,111 @@ static int getDeinterlaceMode() {
     return DEINTERLACE_MODE_NONE;
 }
 
+static bool isDolbyVisionRpuNalType(uint8_t nalType) {
+    // Dolby Vision RPU is carried in HEVC NAL unit type 62. Seeing this in
+    // a HEVC access unit is enough to avoid the VAAPI/Gralloc direct-output
+    // path; ordinary HDR10 HEVC streams do not carry this NAL type.
+    return nalType == 62;
+}
+
+static uint8_t getHevcNalUnitType(const uint8_t* nal, size_t size) {
+    if (!nal || size < 2) {
+        return 0xff;
+    }
+    return (nal[0] >> 1) & 0x3f;
+}
+
+static bool parseHevcLengthPrefixedForDolbyVisionRpu(
+        const uint8_t* data, size_t size, size_t lengthSize, bool* hasRpu) {
+    if (hasRpu) {
+        *hasRpu = false;
+    }
+    if (!data || size < lengthSize + 2 || lengthSize < 1 || lengthSize > 4) {
+        return false;
+    }
+
+    size_t offset = 0;
+    size_t nalCount = 0;
+    while (offset + lengthSize + 2 <= size) {
+        uint32_t nalSize = 0;
+        for (size_t i = 0; i < lengthSize; ++i) {
+            nalSize = (nalSize << 8) | data[offset + i];
+        }
+        offset += lengthSize;
+
+        if (nalSize < 2 || nalSize > size - offset) {
+            return false;
+        }
+
+        if (isDolbyVisionRpuNalType(getHevcNalUnitType(data + offset, nalSize))) {
+            if (hasRpu) {
+                *hasRpu = true;
+            }
+            return true;
+        }
+
+        offset += nalSize;
+        ++nalCount;
+    }
+
+    return nalCount > 0 && offset == size;
+}
+
+static size_t findAnnexBStartCode(const uint8_t* data, size_t size, size_t from, size_t* startCodeSize) {
+    for (size_t i = from; i + 3 <= size; ++i) {
+        if (data[i] == 0 && data[i + 1] == 0) {
+            if (data[i + 2] == 1) {
+                if (startCodeSize) *startCodeSize = 3;
+                return i;
+            }
+            if (i + 4 <= size && data[i + 2] == 0 && data[i + 3] == 1) {
+                if (startCodeSize) *startCodeSize = 4;
+                return i;
+            }
+        }
+    }
+    return size;
+}
+
+static bool containsDolbyVisionRpuAnnexB(const uint8_t* data, size_t size) {
+    if (!data || size < 5) {
+        return false;
+    }
+
+    size_t startCodeSize = 0;
+    size_t start = findAnnexBStartCode(data, size, 0, &startCodeSize);
+    while (start < size) {
+        size_t nalStart = start + startCodeSize;
+        size_t nextStartCodeSize = 0;
+        size_t next = findAnnexBStartCode(data, size, nalStart, &nextStartCodeSize);
+        size_t nalEnd = next < size ? next : size;
+        if (nalEnd > nalStart && isDolbyVisionRpuNalType(getHevcNalUnitType(data + nalStart, nalEnd - nalStart))) {
+            return true;
+        }
+        start = next;
+        startCodeSize = nextStartCodeSize;
+    }
+    return false;
+}
+
+static bool containsDolbyVisionRpu(const uint8_t* data, size_t size) {
+    if (containsDolbyVisionRpuAnnexB(data, size)) {
+        return true;
+    }
+
+    // Android's MP4 extractor normally feeds HEVC samples as length-prefixed
+    // access units. The usual hvcC length size is 4 bytes; keep 2/1-byte
+    // variants for robustness without doing any broad byte-pattern scanning.
+    for (size_t lengthSize : {4u, 2u, 1u}) {
+        bool hasRpu = false;
+        if (parseHevcLengthPrefixedForDolbyVisionRpu(data, size, lengthSize, &hasRpu)) {
+            return hasRpu;
+        }
+    }
+
+    return false;
+}
+
 C2FFMPEGVideoDecodeComponent::C2FFMPEGVideoDecodeComponent(
         const C2FFMPEGComponentInfo* componentInfo,
         const std::shared_ptr<C2FFMPEGVideoDecodeInterface>& intf)
@@ -178,12 +286,20 @@ C2FFMPEGVideoDecodeComponent::C2FFMPEGVideoDecodeComponent(
       mFilterGraph(NULL),
       mFilterSrcCtx(NULL),
       mFilterSinkCtx(NULL),
+      mDoviFilterGraph(NULL),
+      mDoviFilterSrcCtx(NULL),
+      mDoviFilterSinkCtx(NULL),
       mImgConvertCtx(NULL),
       mFrame(NULL),
       mPacket(NULL),
       mCodecAlreadyOpened(false),
       mExtradataReady(false),
       mEOSSignalled(false),
+      mFilterInitialized(false),
+      mDoviFilterInitialized(false),
+      mDisableDrmPrimeForDolbyVision(false),
+      mDoviHardwareFilterDisabled(false),
+      mDoviConvertedFrames(0),
       mFrameColorAspects(C2Color::RANGE_UNSPECIFIED,
                          C2Color::PRIMARIES_UNSPECIFIED,
                          C2Color::TRANSFER_UNSPECIFIED,
@@ -319,6 +435,16 @@ c2_status_t C2FFMPEGVideoDecodeComponent::openDecoder() {
         ffmpeg_hwaccel_init(mCtx);
     }
 
+    if (mDisableDrmPrimeForDolbyVision && mCtx->codec_id == AV_CODEC_ID_HEVC) {
+        // Dolby Vision Profile 5 needs to be converted before Android receives
+        // the frame. Keep FFmpeg/VAAPI decoding when available, but do not use
+        // Android Gralloc-backed VA surfaces as decoder output: some devices
+        // cannot allocate 4K P010 buffers here, and those buffers would bypass
+        // the Dolby Vision -> SDR conversion step anyway.
+        mUtils->mUseDrmPrime = false;
+        ALOGI("openDecoder: Dolby Vision RPU detected, disabling DRM-prime direct output before SDR conversion");
+    }
+
 #if CONFIG_VAAPI
     if (mCtx->hw_device_ctx
             && ((AVHWDeviceContext*)mCtx->hw_device_ctx->data)->type == AV_HWDEVICE_TYPE_VAAPI
@@ -358,6 +484,7 @@ void C2FFMPEGVideoDecodeComponent::deInitDecoder() {
         avfilter_graph_free(&mFilterGraph);
         mFilterSrcCtx = mFilterSinkCtx = NULL;
     }
+    resetDolbyVisionFilter();
     if (mCtx) {
         if (avcodec_is_open(mCtx)) {
             avcodec_flush_buffers(mCtx);
@@ -392,6 +519,10 @@ void C2FFMPEGVideoDecodeComponent::deInitDecoder() {
     mEOSSignalled = false;
     mExtradataReady = false;
     mFilterInitialized = false;
+    mDoviFilterInitialized = false;
+    mDisableDrmPrimeForDolbyVision = false;
+    mDoviHardwareFilterDisabled = false;
+    mDoviConvertedFrames = 0;
     mPendingWorkQueue.clear();
 #if CONFIG_VAAPI
     mBlockPool.reset();
@@ -461,6 +592,261 @@ c2_status_t C2FFMPEGVideoDecodeComponent::sendInputBuffer(
             return C2_OMITTED;
         }
         // Otherwise don't send error to client.
+    }
+
+    return C2_OK;
+}
+
+
+void C2FFMPEGVideoDecodeComponent::resetDolbyVisionFilter() {
+    if (mDoviFilterGraph) {
+        av_freep(&mDoviFilterGraph->opaque);
+        avfilter_graph_free(&mDoviFilterGraph);
+        mDoviFilterSrcCtx = mDoviFilterSinkCtx = NULL;
+    }
+    mDoviFilterInitialized = false;
+}
+
+bool C2FFMPEGVideoDecodeComponent::isDolbyVisionFrame(const AVFrame* frame) const {
+    return frame && av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA) != NULL;
+}
+
+bool C2FFMPEGVideoDecodeComponent::shouldConvertDolbyVision() const {
+    // WayDroid's Android display stack currently exposes no HDR/Dolby Vision
+    // output capability. Dolby Vision Profile 5 needs expensive SDR conversion
+    // to display correctly, which is not real-time for 4K streams in this
+    // Codec2 component. Keep conversion as an explicit debug opt-in so apps or
+    // media servers can fall back to transcoding instead of direct-playing an
+    // unsupported stream.
+    return base::GetBoolProperty("debug.ffmpeg-codec2.dovi.convert", false);
+}
+
+c2_status_t C2FFMPEGVideoDecodeComponent::processDolbyVisionFrame(bool* hasPicture) {
+    int err = 0;
+
+    if (!isDolbyVisionFrame(mFrame)) {
+        *hasPicture = true;
+        return C2_OK;
+    }
+
+    const bool hasHwFrames = mFrame->hw_frames_ctx != NULL && !mDoviHardwareFilterDisabled;
+    if (mFrame->hw_frames_ctx && mDoviHardwareFilterDisabled) {
+        c2_status_t c2err = downloadFrame(true);
+        if (c2err != C2_OK) {
+            *hasPicture = false;
+            return C2_OK;
+        }
+    }
+
+    if (mDoviFilterGraph && mDoviFilterInitialized) {
+        FilterSettings *settings = (FilterSettings*)mDoviFilterGraph->opaque;
+
+        if (settings->width != mFrame->width
+                || settings->height != mFrame->height
+                || settings->format != mFrame->format
+                || settings->hwFrames != hasHwFrames) {
+            resetDolbyVisionFilter();
+        }
+    }
+
+    if (!mDoviFilterGraph) {
+        const AVFilter *buffersrc = avfilter_get_by_name("buffer");
+        const AVFilter *buffersink = avfilter_get_by_name("buffersink");
+        AVFilterInOut *inputs = NULL;
+        AVFilterInOut *outputs = NULL;
+        enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
+        std::string srcArgs;
+        AVRational frameRate = { 0, 1 };
+        const char *graphDesc = hasHwFrames
+                ? "hwmap=derive_device=vulkan,"
+                  "libplacebo=apply_dolbyvision=1:colorspace=bt709:color_primaries=bt709:"
+                  "color_trc=bt709:range=limited:tonemapping=hable:peak_detect=1:format=yuv420p"
+                : "libplacebo=apply_dolbyvision=1:colorspace=bt709:color_primaries=bt709:"
+                  "color_trc=bt709:range=limited:tonemapping=hable:peak_detect=1:format=yuv420p";
+        FilterSettings *settings;
+
+        if (mCtx->time_base.num == 0) {
+            mCtx->time_base.num = 1;
+            mCtx->time_base.den = 90000;
+        }
+
+        inputs = avfilter_inout_alloc();
+        outputs = avfilter_inout_alloc();
+        if (!inputs || !outputs) {
+            ALOGE("processDolbyVisionFrame: oom in filter generation (i/o)");
+            err = -ENOMEM;
+            goto filterend;
+        }
+
+        mDoviFilterGraph = avfilter_graph_alloc();
+        if (!mDoviFilterGraph) {
+            ALOGE("processDolbyVisionFrame: oom in filter generation (graph)");
+            err = -ENOMEM;
+            goto filterend;
+        }
+
+        mDoviFilterGraph->opaque = settings = (FilterSettings*)av_mallocz(sizeof(FilterSettings));
+        if (!settings) {
+            ALOGE("processDolbyVisionFrame: oom in filter generation (settings)");
+            err = -ENOMEM;
+            goto filterend;
+        }
+        settings->width = mFrame->width;
+        settings->height = mFrame->height;
+        settings->format = mFrame->format;
+        settings->hwFrames = hasHwFrames;
+
+        frameRate = mCtx->framerate;
+        if (frameRate.num <= 0 || frameRate.den <= 0) {
+            if (mFrame->duration > 0 && mCtx->time_base.num > 0 && mCtx->time_base.den > 0) {
+                frameRate = av_inv_q(av_mul_q(mCtx->time_base, AVRational{(int)mFrame->duration, 1}));
+            } else {
+                // libplacebo requires a positive vsync duration. Some Codec2 inputs do not
+                // carry frame-rate metadata into FFmpeg, so provide a conservative fallback
+                // rather than letting libplacebo abort the media service.
+                frameRate = AVRational{25, 1};
+            }
+        }
+
+        srcArgs = base::StringPrintf(
+                 "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d:frame_rate=%d/%d",
+                 mFrame->width, mFrame->height, mFrame->format,
+                 mCtx->time_base.num, mCtx->time_base.den,
+                 mCtx->sample_aspect_ratio.num, mCtx->sample_aspect_ratio.den,
+                 frameRate.num, frameRate.den);
+        ALOGI("processDolbyVisionFrame: filter source = %s", srcArgs.c_str());
+        err = avfilter_graph_create_filter(&mDoviFilterSrcCtx, buffersrc, "in",
+                                           srcArgs.c_str(), NULL, mDoviFilterGraph);
+        if (err < 0) {
+            ALOGE("processDolbyVisionFrame: failed to generate filter (source): %s (%08x)",
+                  av_err2str(err), err);
+            goto filterend;
+        } else {
+            AVBufferSrcParameters params = {};
+            params.format = AV_PIX_FMT_NONE;
+            params.frame_rate = frameRate;
+            params.hw_frames_ctx = hasHwFrames ? mFrame->hw_frames_ctx : NULL;
+            params.color_space = mFrame->colorspace;
+            params.color_range = mFrame->color_range;
+
+            err = av_buffersrc_parameters_set(mDoviFilterSrcCtx, &params);
+            if (err < 0) {
+                ALOGE("processDolbyVisionFrame: failed to generate filter (source params): %s (%08x)",
+                      av_err2str(err), err);
+                goto filterend;
+            }
+        }
+
+        err = avfilter_graph_create_filter(&mDoviFilterSinkCtx, buffersink, "out",
+                                           NULL, NULL, mDoviFilterGraph);
+        if (err < 0) {
+            ALOGE("processDolbyVisionFrame: failed to generate filter (sink): %s (%08x)",
+                  av_err2str(err), err);
+            goto filterend;
+        }
+        err = av_opt_set_int_list(mDoviFilterSinkCtx, "pix_fmts", pix_fmts,
+                                  AV_PIX_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+        if (err < 0) {
+            ALOGE("processDolbyVisionFrame: failed to generate filter (sink format): %s (%08x)",
+                  av_err2str(err), err);
+            goto filterend;
+        }
+
+        outputs->name = av_strdup("in");
+        outputs->filter_ctx = mDoviFilterSrcCtx;
+        outputs->pad_idx = 0;
+        outputs->next = NULL;
+
+        inputs->name = av_strdup("out");
+        inputs->filter_ctx = mDoviFilterSinkCtx;
+        inputs->pad_idx = 0;
+        inputs->next = NULL;
+
+        ALOGI("processDolbyVisionFrame: filter graph = %s", graphDesc);
+        err = avfilter_graph_parse_ptr(mDoviFilterGraph, graphDesc,
+                                       &inputs, &outputs, NULL);
+        if (err < 0) {
+            ALOGE("processDolbyVisionFrame: failed to generate filter (graph): %s (%08x)",
+                  av_err2str(err), err);
+            goto filterend;
+        }
+        err = avfilter_graph_config(mDoviFilterGraph, NULL);
+        if (err < 0) {
+            ALOGE("processDolbyVisionFrame: failed to generate filter (config): %s (%08x)",
+                  av_err2str(err), err);
+            goto filterend;
+        }
+
+        mDoviFilterInitialized = true;
+
+filterend:
+        avfilter_inout_free(&inputs);
+        avfilter_inout_free(&outputs);
+        if (!mDoviFilterInitialized && hasHwFrames && err != AVERROR(ENOMEM)) {
+            if (err < 0) {
+                ALOGW("processDolbyVisionFrame: failed to generate hardware filter, falling back to software frames: %s (%08x)",
+                      av_err2str(err), err);
+            }
+            mDoviHardwareFilterDisabled = true;
+            resetDolbyVisionFilter();
+            c2_status_t c2err = downloadFrame(true);
+            if (c2err != C2_OK) {
+                *hasPicture = false;
+                return C2_OK;
+            }
+            return processDolbyVisionFrame(hasPicture);
+        }
+        if (!mDoviFilterInitialized) {
+            resetDolbyVisionFilter();
+        }
+    }
+
+    if (mDoviFilterInitialized) {
+        const int64_t inputPts = mFrame->pts;
+        const int64_t inputBestEffortTimestamp = mFrame->best_effort_timestamp;
+        const int64_t inputPktDts = mFrame->pkt_dts;
+        const int64_t inputDuration = mFrame->duration;
+
+        err = av_buffersrc_add_frame_flags(mDoviFilterSrcCtx, mFrame, AV_BUFFERSRC_FLAG_KEEP_REF);
+        av_frame_unref(mFrame);
+        if (err == 0) {
+            err = av_buffersink_get_frame(mDoviFilterSinkCtx, mFrame);
+            if (err == 0) {
+                mFrame->pts = inputPts;
+                mFrame->best_effort_timestamp = inputBestEffortTimestamp != AV_NOPTS_VALUE
+                        ? inputBestEffortTimestamp : inputPts;
+                mFrame->pkt_dts = inputPktDts;
+                mFrame->duration = inputDuration;
+                mFrame->color_range = AVCOL_RANGE_MPEG;
+                mFrame->color_primaries = AVCOL_PRI_BT709;
+                mFrame->color_trc = AVCOL_TRC_BT709;
+                mFrame->colorspace = AVCOL_SPC_BT709;
+                av_frame_remove_side_data(mFrame, AV_FRAME_DATA_DOVI_METADATA);
+                av_frame_remove_side_data(mFrame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+                av_frame_remove_side_data(mFrame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+                av_frame_remove_side_data(mFrame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+                *hasPicture = true;
+                ++mDoviConvertedFrames;
+                if (mDoviConvertedFrames == 1 || (mDoviConvertedFrames % 120) == 0) {
+                    ALOGD("processDolbyVisionFrame: converted Dolby Vision frame #%u to BT.709 SDR (%s)",
+                          mDoviConvertedFrames, av_get_pix_fmt_name((AVPixelFormat)mFrame->format));
+                }
+            } else if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) {
+                *hasPicture = false;
+            } else {
+                ALOGE("processDolbyVisionFrame: failed to filter frame (output): %s (%08x)",
+                      av_err2str(err), err);
+                *hasPicture = false;
+            }
+        } else {
+            ALOGE("processDolbyVisionFrame: failed to filter frame (input): %s (%08x)",
+                  av_err2str(err), err);
+            *hasPicture = false;
+        }
+    } else {
+        ALOGE("processDolbyVisionFrame: Dolby Vision filter unavailable, dropping frame to avoid wrong-color output");
+        av_frame_unref(mFrame);
+        *hasPicture = false;
     }
 
     return C2_OK;
@@ -819,7 +1205,14 @@ c2_status_t C2FFMPEGVideoDecodeComponent::receiveFrame(bool* hasPicture) {
                         mFilterSrcCtx = mFilterSinkCtx = NULL;
                         mFilterInitialized = false;
                     }
-                    if (mDeinterlaceMode != DEINTERLACE_MODE_NONE && mDeinterlaceIndicator > 0) {
+                    if (isDolbyVisionFrame(mFrame)) {
+                        if (!shouldConvertDolbyVision()) {
+                            ALOGW("receiveFrame: Dolby Vision RPU detected in HEVC output; direct decode is unsupported by default");
+                            *hasPicture = false;
+                            return C2_CORRUPTED;
+                        }
+                        processDolbyVisionFrame(hasPicture);
+                    } else if (mDeinterlaceMode != DEINTERLACE_MODE_NONE && mDeinterlaceIndicator > 0) {
                         bool canDeinterlaceInHW = false;
                         if (mDeinterlaceMode == DEINTERLACE_MODE_AUTO && canDeinterlaceInHW) {
                             c2err = deinterlaceFrame(hasPicture);
@@ -888,7 +1281,14 @@ c2_status_t C2FFMPEGVideoDecodeComponent::receiveFrame(bool* hasPicture) {
             // - if use HW deinterlace: deinterlace => download
             // - else if use SW deinterlace: download => deinterlace
             // - else: download
-            if (mDeinterlaceMode != DEINTERLACE_MODE_NONE && mDeinterlaceIndicator > 0) {
+            if (isDolbyVisionFrame(mFrame)) {
+                if (!shouldConvertDolbyVision()) {
+                    ALOGW("receiveFrame: Dolby Vision RPU detected in HEVC output; direct decode is unsupported by default");
+                    *hasPicture = false;
+                    return C2_CORRUPTED;
+                }
+                processDolbyVisionFrame(hasPicture);
+            } else if (mDeinterlaceMode != DEINTERLACE_MODE_NONE && mDeinterlaceIndicator > 0) {
                 bool canDeinterlaceInHW =
 #if CONFIG_VAAPI
                     mFrame->format == AV_PIX_FMT_VAAPI ||
@@ -1052,6 +1452,14 @@ enum AVPixelFormat C2FFMPEGVideoDecodeComponent::getActiveAVFormat(const AVHWFra
     if (shouldUseP010Output(hwfc)) {
         return AV_PIX_FMT_P010;
     }
+
+    // CPU-mapped output buffers are allocated as HAL_PIXEL_FORMAT_YV12 for the
+    // default YUV_420 mode. Do not use NV12 here just because DRM prime is
+    // enabled; NV12 is only appropriate for VAAPI/DRM surfaces.
+    if (!hwfc && mUtils->getPixelFormatType() == PixelFormatType::YUV_420) {
+        return AV_PIX_FMT_YUV420P;
+    }
+
     return mUtils->getAVFormat();
 }
 
@@ -1444,6 +1852,20 @@ void C2FFMPEGVideoDecodeComponent::process(
         }
 
         if (! mCodecAlreadyOpened) {
+            if (mCtx->codec_id == AV_CODEC_ID_HEVC
+                    && !mDisableDrmPrimeForDolbyVision
+                    && hasInputBuffer
+                    && containsDolbyVisionRpu(rView.data(), inSize)) {
+                if (!shouldConvertDolbyVision()) {
+                    ALOGW("process: Dolby Vision RPU detected in HEVC input; direct decode is unsupported by default");
+                    work->workletsProcessed = 1u;
+                    work->result = C2_CORRUPTED;
+                    return;
+                }
+                mDisableDrmPrimeForDolbyVision = true;
+                ALOGI("process: Dolby Vision RPU detected in HEVC input, enabling experimental SDR conversion and disabling DRM-prime direct output for this stream");
+            }
+
             err = openDecoder();
             if (err != C2_OK) {
                 work->workletsProcessed = 1u;

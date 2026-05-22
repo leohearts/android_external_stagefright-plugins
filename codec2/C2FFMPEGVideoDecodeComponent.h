@@ -69,6 +69,7 @@ private:
     c2_status_t sendInputBuffer(C2ReadView* inBuffer, int64_t timestamp);
     c2_status_t receiveFrame(bool* hasPicture);
     c2_status_t deinterlaceFrame(bool* hasPicture);
+    c2_status_t processDolbyVisionFrame(bool* hasPicture);
     std::shared_ptr<C2Buffer> getOutputBuffer(const std::shared_ptr<C2BlockPool> &pool);
     c2_status_t outputFrame(
         const std::unique_ptr<C2Work> &work,
@@ -76,6 +77,9 @@ private:
     c2_status_t downloadFrame(bool forceSw);
     bool updateColorAspects(std::vector<std::unique_ptr<C2Param>>& configUpdate);
     c2_status_t reconfigureOutputDelay(std::vector<std::unique_ptr<C2Param>>& configUpdate);
+    bool isDolbyVisionFrame(const AVFrame* frame) const;
+    bool shouldConvertDolbyVision() const;
+    void resetDolbyVisionFilter();
     bool shouldUseP010Output(const AVHWFramesContext* hwfc = nullptr) const;
     uint32_t getActivePixelFormat(bool flexible, const AVHWFramesContext* hwfc = nullptr) const;
 #if CONFIG_VAAPI
@@ -116,6 +120,9 @@ private:
     AVFilterGraph *mFilterGraph;
     AVFilterContext *mFilterSrcCtx;
     AVFilterContext *mFilterSinkCtx;
+    AVFilterGraph *mDoviFilterGraph;
+    AVFilterContext *mDoviFilterSrcCtx;
+    AVFilterContext *mDoviFilterSinkCtx;
     struct SwsContext *mImgConvertCtx;
     AVFrame* mFrame;
     AVPacket* mPacket;
@@ -123,6 +130,10 @@ private:
     bool mExtradataReady;
     bool mEOSSignalled;
     bool mFilterInitialized;
+    bool mDoviFilterInitialized;
+    bool mDisableDrmPrimeForDolbyVision;
+    bool mDoviHardwareFilterDisabled;
+    uint32_t mDoviConvertedFrames;
     C2ColorAspectsStruct mFrameColorAspects;
     int mDeinterlaceMode;
     int mDeinterlaceIndicator;
